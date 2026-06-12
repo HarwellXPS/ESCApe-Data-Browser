@@ -168,6 +168,7 @@ class TreeNode:
     children: list = field(default_factory=list)
     region: Optional[Region] = None
     image: Optional[ImageBlob] = None
+    cols: tuple = ()          # extra column values for the browser tree
 
 
 class EscapeParser:
@@ -714,32 +715,68 @@ class EscapeParser:
         return d[s:(e + 2) if e != -1 else len(d)]
 
     # -- tree -----------------------------------------------------------
+    @staticmethod
+    def _be_str(r):
+        if r.decodable and r.energy:
+            return f"{r.energy[0]:.0f}-{r.energy[-1]:.0f} eV"
+        return "no data"
+
+    @staticmethod
+    def _pe_str(r):
+        return f"{r.pass_energy:g}" if r.pass_energy else ""
+
     def _build_tree(self):
         base = os.path.basename(self.path) if self.path else "Experiment"
-        root = TreeNode(f"Experiment: {base}", "SampleAnalysis")
+        root = TreeNode(f"Experiment: {base}", "experiment")
+        is_profile = self.depth_profile.get("is_profile")
+        pos = self.sample_positions()
 
-        # Group regions by their owning sample, preserving order.
-        order = []
-        groups = {}
+        order, groups = [], {}
         for r in self.regions:
             if r.sample not in groups:
                 groups[r.sample] = []
                 order.append(r.sample)
             groups[r.sample].append(r)
-
-        if not order:                       # no regions at all
+        if not order:
             order = [s for _, s in self.samples] or ["Sample"]
             groups = {s: [] for s in order}
 
         for sample_name in order:
-            sample_node = TreeNode(f"Sample: {sample_name}", "SampleAnalysis")
-            for r in groups.get(sample_name, []):
-                cond = (f"  ({r.conditions['X-ray Power']})"
-                        if r.conditions.get("X-ray Power") else "")
-                tag = "" if r.decodable else "  [no data]"
-                sample_node.children.append(
-                    TreeNode(f"{r.name}{cond}{tag}", "EscaSpectrum",
-                             r.offset, region=r))
+            pstr = ""
+            if sample_name in pos:
+                pstr = f"({pos[sample_name][0]:.1f}, {pos[sample_name][1]:.1f} mm)"
+            sample_node = TreeNode(f"Sample: {sample_name}", "sample",
+                                   cols=(pstr, "", "", ""))
+
+            if is_profile:
+                # Sample -> Region type -> per-level leaves
+                byname, rorder = {}, []
+                for r in groups[sample_name]:
+                    if r.name not in byname:
+                        byname[r.name] = []
+                        rorder.append(r.name)
+                    byname[r.name].append(r)
+                for rname in rorder:
+                    rl = byname[rname]
+                    folder = TreeNode(rname, "regionfolder",
+                                      cols=(f"{len(rl)} levels", "",
+                                            self._pe_str(rl[0]), ""))
+                    for r in rl:
+                        et = (f"{r.etch_time:g} s" if r.etch_time is not None
+                              else "")
+                        folder.children.append(TreeNode(
+                            f"Level {r.etch_level}", "EscaSpectrum", r.offset,
+                            region=r,
+                            cols=(self._be_str(r), str(r.n_points),
+                                  self._pe_str(r), et)))
+                    sample_node.children.append(folder)
+            else:
+                for r in groups[sample_name]:
+                    tag = "" if r.decodable else "  [no data]"
+                    sample_node.children.append(TreeNode(
+                        f"{r.name}{tag}", "EscaSpectrum", r.offset, region=r,
+                        cols=(self._be_str(r), str(r.n_points),
+                              self._pe_str(r), "")))
             root.children.append(sample_node)
 
         if self.images:
@@ -1894,7 +1931,7 @@ class BrowserApp:
     def __init__(self, root):
         self.root = root
         self.root.title("ESCApe Explorer — Browser")
-        self.root.geometry("440x600")
+        self.root.geometry("620x640")
         self.parser = EscapeParser()
         self.node_map = {}          # treeview item id -> TreeNode
         self.display = None
@@ -1932,7 +1969,31 @@ class BrowserApp:
         ttk.Button(tb, text="Display window",
                    command=self.show_display).pack(side="left", padx=4)
 
-        self.tree = ttk.Treeview(self.root, show="tree", selectmode="extended")
+        # filter row
+        fb = ttk.Frame(self.root)
+        fb.pack(side="top", fill="x", padx=4, pady=(0, 4))
+        ttk.Label(fb, text="Filter:").pack(side="left")
+        self.filter_var = tk.StringVar()
+        ent = ttk.Entry(fb, textvariable=self.filter_var)
+        ent.pack(side="left", fill="x", expand=True, padx=4)
+        ent.bind("<KeyRelease>", lambda e: self._populate_tree())
+        ttk.Button(fb, text="Clear", width=6,
+                   command=lambda: (self.filter_var.set(""),
+                                    self._populate_tree())).pack(side="left")
+
+        cols = ("detail", "pts", "pe", "etch")
+        self.tree = ttk.Treeview(self.root, columns=cols,
+                                 show="tree headings", selectmode="extended")
+        self.tree.heading("#0", text="Experiment / Sample / Region")
+        self.tree.heading("detail", text="Detail")
+        self.tree.heading("pts", text="Points")
+        self.tree.heading("pe", text="Pass E (eV)")
+        self.tree.heading("etch", text="Etch time")
+        self.tree.column("#0", width=260, stretch=True)
+        self.tree.column("detail", width=120, anchor="w")
+        self.tree.column("pts", width=60, anchor="e")
+        self.tree.column("pe", width=70, anchor="e")
+        self.tree.column("etch", width=80, anchor="e")
         sb = ttk.Scrollbar(self.root, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
@@ -1955,7 +2016,7 @@ class BrowserApp:
         except Exception as exc:
             messagebox.showerror("Load failed", str(exc))
             return
-        self._populate_tree()
+        self._populate_tree(reset_display=True)
         s = self.parser.summary
         self.status.config(
             text=f"{os.path.basename(path)} — {s['n_regions']} regions, "
@@ -1964,26 +2025,40 @@ class BrowserApp:
             messagebox.showwarning("File data corrupted",
                                    self.parser.corruption["message"])
 
-    def _populate_tree(self):
+    def _populate_tree(self, reset_display=False):
         self.tree.delete(*self.tree.get_children())
         self.node_map.clear()
         n_samples = len(self.parser.tree.children) if self.parser.tree else 0
+        flt = getattr(self, "filter_var", None)
+        flt = flt.get().strip().lower() if flt else ""
+
+        def matches(node):
+            if not flt:
+                return True
+            hay = (node.label + " " + " ".join(str(c) for c in node.cols)).lower()
+            if flt in hay:
+                return True
+            return any(matches(c) for c in node.children)
 
         def add(parent, node, depth=0):
-            # Keep the tree readable for big experiments: expand the root, and
-            # expand sample folders only when there are just a few of them.
-            opened = (depth == 0) or (depth == 1 and n_samples <= 3)
-            iid = self.tree.insert(parent, "end", text=node.label, open=opened)
+            if not matches(node):
+                return
+            opened = (depth == 0) or bool(flt) or (depth == 1 and n_samples <= 3)
+            cols = tuple(node.cols) if node.cols else ("", "", "", "")
+            iid = self.tree.insert(parent, "end", text=node.label, open=opened,
+                                   values=cols)
             self.node_map[iid] = node
             for c in node.children:
                 add(iid, c, depth + 1)
 
         if self.parser.tree:
             add("", self.parser.tree)
-        self.show_display()
-        if self.display and self.display.winfo_exists():
-            self.display.set_images(self.parser.images)
-            self.display.show_regions([])
+
+        if reset_display:
+            self.show_display()
+            if self.display and self.display.winfo_exists():
+                self.display.set_images(self.parser.images)
+                self.display.show_regions([])
 
     def on_select(self, _event):
         sel = self.tree.selection()

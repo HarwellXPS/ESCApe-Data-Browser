@@ -54,7 +54,11 @@ Flags:
 ## Using the app
 
 1. **File → Open .experiment…** and choose a file.
-2. The **Browser** window shows the tree. A second **Display** window opens
+2. The **Browser** window shows a tree with columns (detail, points, pass
+   energy, etch time) and a **Filter** box; its shape adapts to the file
+   (samples show their stage position; depth profiles nest as Sample → region
+   → per-level entries with each level's etch time, and selecting a region
+   folder takes every level under it). A second **Display** window opens
    with three panels that update live as you click items:
    * **Spectra** (top-left) — the selected spectrum. Select several at once
      (Ctrl/Shift-click, or click a sample to take all its regions) and they
