@@ -94,6 +94,8 @@ class Region:
     anode: str = ""
     tf_ke: Optional[list] = None       # transmission-function kinetic energies
     tf_values: Optional[list] = None   # transmission-function values
+    etch_level: Optional[int] = None   # depth-profile level (0 = surface)
+    etch_time: Optional[float] = None  # cumulative etch time (s) at this level
 
     @property
     def n_points(self) -> int:
@@ -182,6 +184,10 @@ class EscapeParser:
         self.samples: list = []        # list[(offset, name)]
         self.tree: Optional[TreeNode] = None
         self.instrument = {}           # system-wide metadata
+        self.depth_profile = {"is_profile": False, "n_levels": 0,
+                              "regions_per_level": 0, "etch_per_level": 0.0,
+                              "total_etch_time": 0.0, "cumulative": [],
+                              "etch_source": ""}
         self.corruption = {"corrupted": False, "message": ""}
         self.summary = {}
 
@@ -195,6 +201,7 @@ class EscapeParser:
         self._parse_samples()
         self._parse_instrument()
         self._parse_regions()
+        self._parse_depth_profile()
         self._parse_images()
         self._build_tree()
         self._build_summary()
@@ -546,6 +553,96 @@ class EscapeParser:
         return None
 
     # -- images ---------------------------------------------------------
+    # -- depth profile --------------------------------------------------
+    GRAPH_MARKER = b"DataTypes.NonUniformGraphData"
+
+    def _decode_duration_graph(self, off):
+        """Decode (etch number, duration) pairs from a NonUniformGraphData
+        block. Returns the list of per-etch durations (best effort)."""
+        e = off + len(self.GRAPH_MARKER)
+        base = self.raw.find(struct.pack("<d", 1.0), e, e + 220)
+        if base < 0:
+            return []
+        d = lambda o: struct.unpack_from("<d", self.raw, o)[0]
+        result = []
+        for stride in (17, 16):
+            ys, k = [], 0
+            while True:
+                ox = base + k * stride
+                if ox + 16 > len(self.raw):
+                    break
+                try:
+                    x = d(ox); y = d(ox + 8)
+                except struct.error:
+                    break
+                if x != x or abs(x - (k + 1)) > 0.01:
+                    break
+                ys.append(y)
+                k += 1
+            if len(ys) >= 2:
+                result = ys
+                break
+        return result
+
+    def _parse_depth_profile(self):
+        raw = self.raw
+        is_profile = (b"DepthProfileData" in raw or b"Depth Profile" in raw
+                      or b"Mb6EtchSettings" in raw)
+        if not is_profile or not self.regions:
+            return
+
+        names = [r.name for r in self.regions]
+        rpl = next((i for i in range(1, len(names))
+                    if names[i] == names[0]), len(names))
+        if rpl < 1 or len(names) % rpl != 0:
+            rpl = 1
+        n_levels = len(self.regions) // rpl
+
+        durs = []
+        for off in self._find_all(self.GRAPH_MARKER):
+            labels = [s for _, s in self._strings_between(off, off + 60)]
+            if any("Duration" in s for s in labels):
+                durs += self._decode_duration_graph(off)
+
+        n_etches = max(0, n_levels - 1)
+        per_etch, source = [], ""
+        if durs:
+            import statistics
+            med = statistics.median(durs)
+            constant = all(abs(x - med) <= 0.01 * med + 1e-9 for x in durs)
+            if constant:
+                per_etch = [med] * n_etches
+                source = f"constant {med:g} s/etch (from instrument record)"
+            else:
+                per_etch = list(durs)
+                if len(per_etch) < n_etches:
+                    per_etch += [per_etch[-1]] * (n_etches - len(per_etch))
+                per_etch = per_etch[:n_etches]
+                source = "per-etch durations (from instrument record)"
+        else:
+            per_etch = [0.0] * n_etches
+            source = "etch time not recorded in file"
+
+        cumulative = [0.0]
+        for dd in per_etch:
+            cumulative.append(cumulative[-1] + dd)
+
+        for idx, r in enumerate(self.regions):
+            lvl = idx // rpl
+            r.etch_level = lvl
+            r.etch_time = cumulative[lvl] if lvl < len(cumulative) else None
+
+        self.depth_profile = {
+            "is_profile": True,
+            "n_levels": n_levels,
+            "regions_per_level": rpl,
+            "etch_per_level": (per_etch[0] if per_etch else 0.0),
+            "total_etch_time": cumulative[-1] if cumulative else 0.0,
+            "cumulative": cumulative,
+            "etch_source": source,
+            "n_etches": n_etches,
+        }
+
     def _parse_images(self):
         imgs = []
         for off in self._find_all(self.IMAGE_MARKER):
@@ -633,6 +730,10 @@ class EscapeParser:
         md["Region"] = r.name
         md["Technique"] = r.technique
         md["Date acquired"] = self._date_for(r.offset)
+        if r.etch_level is not None:
+            md["Etch level"] = str(r.etch_level)
+            md["Etch time (s)"] = (f"{r.etch_time:g}"
+                                   if r.etch_time is not None else "")
         md["Instrument"] = self.instrument.get("Instrument", "")
         md["Acquisition computer"] = self.instrument.get("Acquisition computer", "")
         md["X-ray source"] = self.instrument.get("X-ray source", "")
@@ -748,7 +849,15 @@ def export_vamas(regions, path, institution="Not specified",
         a(str(now.year)); a(str(now.month)); a(str(now.day))
         a(str(now.hour)); a(str(now.minute)); a(str(now.second))
         a("0")                    # hours in advance of GMT
-        a("0")                    # lines in block comment
+        # block comment: include etch info for depth profiles
+        comment = []
+        if r.etch_level is not None:
+            comment.append(f"Etch level : {r.etch_level}")
+        if r.etch_time is not None:
+            comment.append(f"Etch time (s) : {r.etch_time:g}")
+        a(str(len(comment)))      # lines in block comment
+        for c in comment:
+            a(c)
         a("XPS")                  # technique
         a(anode)                  # analysis source label
         a(f"{hv:.6g}")            # source characteristic energy
@@ -1222,9 +1331,9 @@ class DisplayWindow(tk.Toplevel):
         samples = sorted({r.sample for r in self.regions})
         if len(self.regions) == 1 or len(samples) == 1:
             base = parser.region_metadata(self.regions[0])
-            order = ["Sample", "Date acquired", "Instrument",
-                     "Acquisition computer", "X-ray source", "Anode",
-                     "Photon energy (eV)", "Source power (W)",
+            order = ["Sample", "Date acquired", "Etch level", "Etch time (s)",
+                     "Instrument", "Acquisition computer", "X-ray source",
+                     "Anode", "Photon energy (eV)", "Source power (W)",
                      "Charge neutraliser", "Ion gun / sputtering"]
             for k in order:
                 if base.get(k):
@@ -1295,7 +1404,7 @@ class ExportDialog(tk.Toplevel):
         super().__init__(master)
         self.app = app
         self.title("Export data")
-        self.geometry("460x560")
+        self.geometry("470x640")
         self.transient(master)
         self.grab_set()
 
@@ -1321,25 +1430,30 @@ class ExportDialog(tk.Toplevel):
         canvas.bind_all("<MouseWheel>",
                         lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
 
-        # Group regions by sample
-        self.vars = []
-        groups, order = {}, []
-        for r in app.parser.regions:
-            groups.setdefault(r.sample, []).append(r)
-            if r.sample not in order:
-                order.append(r.sample)
+        self.profile = app.parser.depth_profile
+        self.vars = []           # per-region checkboxes (non-profile)
+        self.type_vars = {}      # per-region-type checkboxes (profile)
 
-        for sample in order:
-            ttk.Label(frame, text=sample or "Sample",
-                      font=("", 9, "bold")).pack(anchor="w", pady=(8, 1))
-            for r in groups[sample]:
-                v = tk.BooleanVar(value=r.decodable)
-                state = "normal" if r.decodable else "disabled"
-                suffix = "" if r.decodable else "   (no data)"
-                ttk.Checkbutton(frame, variable=v, state=state,
-                                text=f"   {r.name}  [{r.n_points} pts]{suffix}"
-                                ).pack(anchor="w", pady=0)
-                self.vars.append((v, r))
+        if self.profile.get("is_profile"):
+            self._build_profile_selectors(frame)
+        else:
+            groups, order = {}, []
+            for r in app.parser.regions:
+                groups.setdefault(r.sample, []).append(r)
+                if r.sample not in order:
+                    order.append(r.sample)
+            for sample in order:
+                ttk.Label(frame, text=sample or "Sample",
+                          font=("", 9, "bold")).pack(anchor="w", pady=(8, 1))
+                for r in groups[sample]:
+                    v = tk.BooleanVar(value=r.decodable)
+                    state = "normal" if r.decodable else "disabled"
+                    suffix = "" if r.decodable else "   (no data)"
+                    ttk.Checkbutton(
+                        frame, variable=v, state=state,
+                        text=f"   {r.name}  [{r.n_points} pts]{suffix}"
+                        ).pack(anchor="w", pady=0)
+                    self.vars.append((v, r))
 
         # format
         fmt_frame = ttk.LabelFrame(self, text="Format")
@@ -1366,13 +1480,86 @@ class ExportDialog(tk.Toplevel):
                            "regions can be exported. See the loader warning."
                       ).pack(padx=12, pady=(0, 10))
 
+    def _build_profile_selectors(self, frame):
+        dp = self.profile
+        total_min = dp["total_etch_time"] / 60.0
+        ttk.Label(frame, justify="left", font=("", 9),
+                  text=(f"Depth profile: {dp['n_levels']} levels, "
+                        f"{dp['regions_per_level']} regions/level\n"
+                        f"Etch: {dp['etch_source']}\n"
+                        f"Total etch time: {dp['total_etch_time']:g} s "
+                        f"({total_min:g} min)")).pack(anchor="w", pady=(4, 8))
+
+        ttk.Label(frame, text="Regions to include:",
+                  font=("", 9, "bold")).pack(anchor="w")
+        seen = []
+        for r in self.app.parser.regions:
+            if r.name not in seen:
+                seen.append(r.name)
+        for name in seen:
+            v = tk.BooleanVar(value=True)
+            ttk.Checkbutton(frame, variable=v, text=f"   {name}"
+                            ).pack(anchor="w")
+            self.type_vars[name] = v
+
+        ttk.Label(frame, text="Levels to include:", font=("", 9, "bold")
+                  ).pack(anchor="w", pady=(10, 1))
+        self.level_mode = tk.StringVar(value="all")
+        nlev = dp["n_levels"]
+        for val, txt in [("all", f"All {nlev} levels"),
+                         ("first", "First N levels"),
+                         ("every", "Every Nth level"),
+                         ("range", "Level range")]:
+            ttk.Radiobutton(frame, text=txt, value=val,
+                            variable=self.level_mode).pack(anchor="w")
+        spin = ttk.Frame(frame)
+        spin.pack(anchor="w", pady=4)
+        ttk.Label(spin, text="N / step:").pack(side="left")
+        self.n_spin = tk.IntVar(value=min(61, nlev))
+        ttk.Spinbox(spin, from_=1, to=nlev, width=6,
+                    textvariable=self.n_spin).pack(side="left", padx=4)
+        ttk.Label(spin, text="range:").pack(side="left", padx=(10, 2))
+        self.range_from = tk.IntVar(value=0)
+        self.range_to = tk.IntVar(value=nlev - 1)
+        ttk.Spinbox(spin, from_=0, to=nlev - 1, width=5,
+                    textvariable=self.range_from).pack(side="left")
+        ttk.Label(spin, text="–").pack(side="left")
+        ttk.Spinbox(spin, from_=0, to=nlev - 1, width=5,
+                    textvariable=self.range_to).pack(side="left")
+
+    def _selected_regions(self):
+        if not self.profile.get("is_profile"):
+            return [r for v, r in self.vars if v.get()]
+        types = {n for n, v in self.type_vars.items() if v.get()}
+        mode = self.level_mode.get()
+        n = max(1, self.n_spin.get())
+        lo, hi = self.range_from.get(), self.range_to.get()
+
+        def level_ok(lvl):
+            if lvl is None:
+                return True
+            if mode == "all":
+                return True
+            if mode == "first":
+                return lvl < n
+            if mode == "every":
+                return lvl % n == 0
+            if mode == "range":
+                return lo <= lvl <= hi
+            return True
+
+        return [r for r in self.app.parser.regions
+                if r.decodable and r.name in types and level_ok(r.etch_level)]
+
     def _set_all(self, value):
         for v, r in self.vars:
             if r.decodable:
                 v.set(value)
+        for v in self.type_vars.values():
+            v.set(value)
 
     def do_export(self):
-        chosen = [r for v, r in self.vars if v.get()]
+        chosen = self._selected_regions()
         if not chosen:
             messagebox.showwarning("Nothing selected",
                                    "Select at least one region to export.")

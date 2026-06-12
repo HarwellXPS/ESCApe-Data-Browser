@@ -77,6 +77,23 @@ Flags:
    quality. CSV gives one row per region; PDF is a formatted report with one
    section per sample.
 
+## Depth profiles
+
+Sputter depth profiles are detected automatically. For these files the export
+dialog replaces the long per-region list with:
+
+* **region-type checkboxes** (e.g. Survey, O 1s, Mo 3d) — choose which
+  regions to include across all levels;
+* **level selection** — *All levels*, *First N*, *Every Nth*, or a *level
+  range* (so you can, for example, match a CasaXPS export of the first 61
+  levels, or thin a 200-level profile to every 10th).
+
+The app reads the per-etch duration from the instrument record, computes the
+**sequential etch time** for every level (level 0 = surface at t = 0, then the
+cumulative sputter time), and reports the **total etch time**. The etch level
+and etch time appear in the metadata CSV/PDF, in the Display metadata panel,
+and are written into each VAMAS block as comment lines.
+
 ## Notes
 
 * **tkinter** is part of Python but needs an OS package on some Linux systems:
