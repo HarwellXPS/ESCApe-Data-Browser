@@ -64,7 +64,15 @@ Flags:
    * **Metadata** (right) — acquisition details for the selection: sample,
      date acquired, instrument, source/anode, power, pass energy, etc.
    * **Images** (bottom strip) — the holder camera snapshots as selectable
-     thumbnails; click one to open it full size.
+     thumbnails; click one to open it full size. The image window offers two
+     ways to see where each sample sat:
+     - **Stage map (beside)** — a schematic X–Y plot in mm next to the photo,
+       with the current spectrum selection highlighted; always available.
+     - **Overlay positions on photo** — draws the markers directly on the
+       photograph. This needs a one-time **Calibrate…** step where you enter
+       your camera’s image centre (mm), mm-per-pixel, and any X/Y flip or
+       rotation. The calibration is saved (in your home folder) and reused
+       automatically; adjust it until the markers land on the right samples.
 3. **File → Export spectra…** to pick regions (grouped by sample, with
    All/None) and export them as CSV or VAMAS. VAMAS output is CasaXPS-
    compatible: a kinetic-energy abscissa with two corresponding variables,

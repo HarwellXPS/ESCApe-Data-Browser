@@ -38,6 +38,8 @@ from __future__ import annotations
 import os
 import re
 import csv
+import json
+import math
 import struct
 import datetime
 from dataclasses import dataclass, field
@@ -96,6 +98,8 @@ class Region:
     tf_values: Optional[list] = None   # transmission-function values
     etch_level: Optional[int] = None   # depth-profile level (0 = surface)
     etch_time: Optional[float] = None  # cumulative etch time (s) at this level
+    pos_x: Optional[float] = None      # stage analysis position X (mm)
+    pos_y: Optional[float] = None      # stage analysis position Y (mm)
 
     @property
     def n_points(self) -> int:
@@ -173,6 +177,7 @@ class EscapeParser:
     IMAGE_MARKER = b"DataTypes.HolderContentSnapshotData"
     SAMPLE_MARKER = b"ProcessData.SampleAnalysis"
     SETTINGS_MARKER = b"NICPU.Acquisition.Spectrum.SpectroscopySettings"
+    LOCATION_MARKER = b"SampleHandling.InstrumentAnalysisLocation"
     PASS_ENERGIES = (2, 5, 10, 20, 40, 80, 160, 224, 280)
 
     def __init__(self):
@@ -201,6 +206,7 @@ class EscapeParser:
         self._parse_samples()
         self._parse_instrument()
         self._parse_regions()
+        self._parse_positions()
         self._parse_depth_profile()
         self._parse_images()
         self._build_tree()
@@ -643,6 +649,50 @@ class EscapeParser:
             "n_etches": n_etches,
         }
 
+    # -- analysis positions --------------------------------------------
+    def _parse_positions(self):
+        """Extract stage analysis positions (mm) from InstrumentAnalysisLocation
+        blocks. Each stores two consecutive float64 (metres). The first block
+        for each sample gives that sample's analysis position (later blocks are
+        auto-Z / alignment points)."""
+        d = lambda o: struct.unpack_from("<d", self.raw, o)[0]
+        rep = {}
+        loc = []
+        if self.corruption["corrupted"]:
+            self._locations, self._sample_pos = [], {}
+            return
+        for off in self._find_all(self.LOCATION_MARKER):
+            e = off + len(self.LOCATION_MARKER)
+            xy = None
+            for k in range(40, 150):
+                try:
+                    x = d(e + k); y = d(e + k + 8)
+                except struct.error:
+                    break
+                if (x == x and y == y and abs(x) < 0.06 and abs(y) < 0.06
+                        and (abs(x) + abs(y)) > 1e-5):
+                    xy = (x * 1000.0, y * 1000.0)
+                    break
+            if xy is None:
+                continue
+            owner = self._sample_for(off)
+            loc.append((off, owner, xy[0], xy[1]))
+            rep.setdefault(owner, xy)      # first block per sample wins
+        self._locations = loc
+        self._sample_pos = rep
+        for r in self.regions:
+            if r.sample in rep:
+                r.pos_x, r.pos_y = rep[r.sample]
+
+    def analysis_positions(self):
+        """Distinct analysis positions as (label, x_mm, y_mm) per sample."""
+        return [(s, xy[0], xy[1])
+                for s, xy in getattr(self, "_sample_pos", {}).items()]
+
+    def sample_positions(self):
+        """One representative position per sample: {sample: (x, y)}."""
+        return dict(getattr(self, "_sample_pos", {}))
+
     def _parse_images(self):
         imgs = []
         for off in self._find_all(self.IMAGE_MARKER):
@@ -730,6 +780,9 @@ class EscapeParser:
         md["Region"] = r.name
         md["Technique"] = r.technique
         md["Date acquired"] = self._date_for(r.offset)
+        if r.pos_x is not None:
+            md["Position X (mm)"] = f"{r.pos_x:.3f}"
+            md["Position Y (mm)"] = f"{r.pos_y:.3f}"
         if r.etch_level is not None:
             md["Etch level"] = str(r.etch_level)
             md["Etch time (s)"] = (f"{r.etch_time:g}"
@@ -1074,6 +1127,111 @@ def _metadata_pdf_matplotlib(parser, samples, path):
 # ==========================================================================
 #  GUI
 # ==========================================================================
+CALIB_PATH = os.path.join(os.path.expanduser("~"), ".escape_explorer_calib.json")
+
+
+def load_calibration():
+    try:
+        with open(CALIB_PATH) as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def save_calibration(c):
+    try:
+        with open(CALIB_PATH, "w") as fh:
+            json.dump(c, fh, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def stage_to_pixel(x_mm, y_mm, img_w, img_h, c):
+    """Map a stage coordinate (mm) to an image pixel using a calibration:
+    {centre_x_mm, centre_y_mm, mm_per_px, flip_x, flip_y, rotation_deg}."""
+    dx = (x_mm - c["centre_x_mm"]) / c["mm_per_px"]
+    dy = (y_mm - c["centre_y_mm"]) / c["mm_per_px"]
+    if c.get("flip_x"):
+        dx = -dx
+    if c.get("flip_y"):
+        dy = -dy
+    th = math.radians(c.get("rotation_deg", 0.0))
+    rx = dx * math.cos(th) - dy * math.sin(th)
+    ry = dx * math.sin(th) + dy * math.cos(th)
+    return img_w / 2.0 + rx, img_h / 2.0 + ry
+
+
+class CalibrationDialog(tk.Toplevel):
+    """Enter the one-time camera-to-stage calibration."""
+
+    def __init__(self, master, on_save, current=None):
+        super().__init__(master)
+        self.on_save = on_save
+        self.title("Camera calibration")
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set()
+        c = current or {"centre_x_mm": 0.0, "centre_y_mm": 0.0,
+                        "mm_per_px": 0.02, "flip_x": False, "flip_y": False,
+                        "rotation_deg": 0.0}
+
+        intro = ("Map stage coordinates (mm) onto the holder photo. These are "
+                 "fixed for your camera setup — enter them once.\n\n"
+                 "• Image centre X/Y: the stage position (mm) at the centre of "
+                 "the photo.\n"
+                 "• mm per pixel: image width in mm ÷ pixel width.\n"
+                 "• Flip X/Y, rotation: correct the photo's orientation so "
+                 "markers land on the right samples.")
+        ttk.Label(self, text=intro, wraplength=380, justify="left",
+                  padding=12).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        self.vars = {}
+        rows = [("Image centre X (mm)", "centre_x_mm"),
+                ("Image centre Y (mm)", "centre_y_mm"),
+                ("mm per pixel", "mm_per_px"),
+                ("Rotation (degrees)", "rotation_deg")]
+        r = 1
+        for label, key in rows:
+            ttk.Label(self, text=label).grid(row=r, column=0, sticky="e",
+                                             padx=(12, 6), pady=3)
+            v = tk.StringVar(value=str(c.get(key, 0.0)))
+            ttk.Entry(self, textvariable=v, width=14).grid(
+                row=r, column=1, sticky="w", padx=(0, 12))
+            self.vars[key] = v
+            r += 1
+        self.flip_x = tk.BooleanVar(value=c.get("flip_x", False))
+        self.flip_y = tk.BooleanVar(value=c.get("flip_y", False))
+        ttk.Checkbutton(self, text="Flip X", variable=self.flip_x).grid(
+            row=r, column=0, sticky="w", padx=12)
+        ttk.Checkbutton(self, text="Flip Y", variable=self.flip_y).grid(
+            row=r, column=1, sticky="w")
+        r += 1
+        btns = ttk.Frame(self)
+        btns.grid(row=r, column=0, columnspan=2, pady=12)
+        ttk.Button(btns, text="Save", command=self._save).pack(side="left", padx=6)
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="left")
+
+    def _save(self):
+        try:
+            calib = {
+                "centre_x_mm": float(self.vars["centre_x_mm"].get()),
+                "centre_y_mm": float(self.vars["centre_y_mm"].get()),
+                "mm_per_px": float(self.vars["mm_per_px"].get()),
+                "rotation_deg": float(self.vars["rotation_deg"].get()),
+                "flip_x": self.flip_x.get(),
+                "flip_y": self.flip_y.get(),
+            }
+            if calib["mm_per_px"] == 0:
+                raise ValueError("mm per pixel cannot be zero.")
+        except ValueError as exc:
+            messagebox.showerror("Invalid calibration", str(exc))
+            return
+        save_calibration(calib)
+        self.on_save(calib)
+        self.destroy()
+
+
 class DisplayWindow(tk.Toplevel):
     """Composite display: spectra grid (top-left), metadata (right),
     selectable image filmstrip (bottom). Renders 1..16 spectra per page in a
@@ -1092,6 +1250,7 @@ class DisplayWindow(tk.Toplevel):
         self.page = 0
         self._thumb_imgs = []      # keep refs so Tk doesn't GC them
         self._view_photo = None
+        self.calib = load_calibration()   # camera-to-stage calibration
 
         # --- toolbar ---------------------------------------------------
         tb = ttk.Frame(self)
@@ -1201,24 +1360,155 @@ class DisplayWindow(tk.Toplevel):
     def open_image(self, blob):
         viewer = tk.Toplevel(self)
         viewer.title(blob.name)
+        positions = self.app.parser.sample_positions()
+        self._cur_blob = blob
+
+        bar = ttk.Frame(viewer)
+        bar.pack(side="top", fill="x", padx=6, pady=4)
+        show_map = tk.BooleanVar(value=False)
+        overlay = tk.BooleanVar(value=False)
+        body = ttk.Frame(viewer)
+        body.pack(side="top", fill="both", expand=True)
+        photo_frame = ttk.Frame(body)
+        photo_frame.pack(side="left", fill="both", expand=True)
+        map_frame = ttk.Frame(body)
+
+        def redraw_photo():
+            for w in photo_frame.winfo_children():
+                w.destroy()
+            if overlay.get() and self.calib and HAVE_MPL and positions:
+                self._render_photo_overlay(photo_frame, blob, positions)
+            else:
+                self._render_plain_photo(photo_frame, blob)
+
+        def toggle_map():
+            if show_map.get() and HAVE_MPL and positions:
+                map_frame.pack(side="left", fill="both", expand=True)
+                self._render_stage_map(map_frame)
+            else:
+                map_frame.pack_forget()
+
+        def toggle_overlay():
+            if overlay.get() and not self.calib:
+                overlay.set(False)
+                if messagebox.askyesno(
+                        "Calibration needed",
+                        "Overlaying markers on the photo needs a one-time "
+                        "camera calibration. Set it now?"):
+                    open_calib()
+                return
+            redraw_photo()
+
+        def open_calib():
+            def saved(c):
+                self.calib = c
+                overlay.set(True)
+                redraw_photo()
+            CalibrationDialog(viewer, saved, current=self.calib)
+
+        ttk.Button(bar, text="Calibrate…", command=open_calib).pack(side="left")
+        ov_cb = ttk.Checkbutton(bar, variable=overlay, command=toggle_overlay,
+                                text="Overlay positions on photo")
+        ov_cb.pack(side="left", padx=8)
+        map_cb = ttk.Checkbutton(bar, variable=show_map, command=toggle_map,
+                                 text="Stage map (beside)")
+        map_cb.pack(side="left")
+        if not positions:
+            for w in (ov_cb, map_cb):
+                w.configure(state="disabled")
+            ttk.Label(bar, text="  (no positions recorded)").pack(side="left")
+        elif not HAVE_MPL:
+            for w in (ov_cb, map_cb):
+                w.configure(state="disabled")
+
+        redraw_photo()
+
+    def _render_plain_photo(self, parent, blob):
         if not HAVE_PIL:
-            ttk.Label(viewer, padding=20,
+            ttk.Label(parent, padding=20,
                       text="Pillow is not installed.\n\n  pip install pillow"
                       ).pack()
             return
         jpeg = self.app.parser.extract_jpeg(blob)
         if jpeg is None:
-            ttk.Label(viewer, padding=20,
+            ttk.Label(parent, padding=20,
                       text=f"Image cannot be displayed.\n\n{blob.note}").pack()
             return
         try:
             import io
             img = Image.open(io.BytesIO(jpeg))
-            img.thumbnail((1000, 760))
+            img.thumbnail((760, 580))
             self._view_photo = ImageTk.PhotoImage(img)
-            ttk.Label(viewer, image=self._view_photo).pack()
+            ttk.Label(parent, image=self._view_photo).pack()
         except Exception as exc:
-            ttk.Label(viewer, padding=20, text=f"Could not render:\n{exc}").pack()
+            ttk.Label(parent, padding=20, text=f"Could not render:\n{exc}").pack()
+
+    def _render_photo_overlay(self, parent, blob, positions):
+        """Show the photo with analysis markers placed via the calibration."""
+        jpeg = self.app.parser.extract_jpeg(blob)
+        if jpeg is None or not HAVE_PIL:
+            self._render_plain_photo(parent, blob)
+            return
+        import io
+        img = Image.open(io.BytesIO(jpeg)).convert("RGB")
+        w, h = img.size
+        sel_samples = {r.sample for r in self.regions}
+        fig = Figure(figsize=(7.2, 5.6), dpi=100)
+        ax = fig.add_subplot(111)
+        ax.imshow(img, extent=[0, w, h, 0])   # top-left origin
+        for sample, (x_mm, y_mm) in positions.items():
+            px, py = stage_to_pixel(x_mm, y_mm, w, h, self.calib)
+            hot = sample in sel_samples
+            ax.scatter([px], [py], s=160 if hot else 90,
+                       facecolors="none",
+                       edgecolors="#ff2d2d" if hot else "#19e0ff",
+                       linewidths=2.2 if hot else 1.6, zorder=3)
+            ax.annotate(sample, (px, py), textcoords="offset points",
+                        xytext=(7, -7), fontsize=8,
+                        color="#ff2d2d" if hot else "#19e0ff",
+                        fontweight=("bold" if hot else "normal"))
+        ax.set_xlim(0, w); ax.set_ylim(h, 0)
+        ax.set_axis_off()
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=parent)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        canvas.draw()
+        ttk.Label(parent, font=("", 8), foreground="#555", wraplength=560,
+                  justify="left",
+                  text="Markers placed from your saved calibration. If they're "
+                       "off, use Calibrate… to adjust centre, scale, flip or "
+                       "rotation.").pack(side="bottom", fill="x", padx=4)
+
+    def _render_stage_map(self, parent):
+        for w in parent.winfo_children():
+            w.destroy()
+        positions = self.app.parser.sample_positions()
+        sel_samples = {r.sample for r in self.regions}
+        fig = Figure(figsize=(4.6, 4.4), dpi=100)
+        ax = fig.add_subplot(111)
+        for sample, (x, y) in positions.items():
+            hot = sample in sel_samples
+            ax.scatter([x], [y], s=120 if hot else 70,
+                       c="#d33" if hot else "#3a6ea5",
+                       edgecolors="black", zorder=3)
+            ax.annotate(sample, (x, y), textcoords="offset points",
+                        xytext=(6, 5), fontsize=8,
+                        fontweight=("bold" if hot else "normal"))
+        ax.set_xlabel("Stage X (mm)")
+        ax.set_ylabel("Stage Y (mm)")
+        ax.set_title("Analysis positions on holder")
+        ax.grid(True, ls=":", alpha=0.5)
+        ax.set_aspect("equal", adjustable="datalim")
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=parent)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        canvas.draw()
+        ttk.Label(parent, font=("", 8), foreground="#555", wraplength=300,
+                  justify="left",
+                  text="Schematic stage coordinates (mm). Highlighted points "
+                       "match the current spectrum selection. Not overlaid on "
+                       "the photo: the file has no camera calibration.").pack(
+            side="bottom", fill="x", padx=4, pady=(0, 4))
 
     # -- selection entry points ----------------------------------------
     def show_node(self, node: TreeNode):
