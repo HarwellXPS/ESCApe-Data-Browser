@@ -66,7 +66,10 @@ Flags:
    * **Images** (bottom strip) — the holder camera snapshots as selectable
      thumbnails; click one to open it full size.
 3. **File → Export spectra…** to pick regions (grouped by sample, with
-   All/None) and export them as CSV or VAMAS.
+   All/None) and export them as CSV or VAMAS. VAMAS output is CasaXPS-
+   compatible: a kinetic-energy abscissa with two corresponding variables,
+   **Intensity** and the interpolated spectrometer **Transmission** function
+   (this can be toggled off in the export dialog).
 4. **File → Export metadata → CSV / PDF** (or the **Metadata…** button) to save
    the per-sample acquisition metadata — system/instrument, X-ray source and
    anode, source power, pass energy, step size, dwell time, lens mode,
@@ -80,6 +83,13 @@ Flags:
   `sudo apt-get install python3-tk` (Debian/Ubuntu),
   `sudo dnf install python3-tkinter` (Fedora). The launcher will tell you if
   it’s missing.
+* The VAMAS exporter writes the spectrometer transmission function as a
+  second corresponding variable, interpolated (and extrapolated at the ends)
+  from the instrument's calibration onto each spectrum's kinetic-energy grid.
+  This matches CasaXPS output exactly — intensities are identical and
+  transmission agrees to floating-point precision — so files round-trip
+  through CasaXPS. Untick the option in the export dialog for an
+  intensity-only file.
 * Binding energy is computed as *photon energy − kinetic energy* and is **not
   charge-corrected**, so peaks may be shifted by a few eV on charging samples.
 * Acquisition metadata (pass energy, dwell, step, source, etc.) is read from

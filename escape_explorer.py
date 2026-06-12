@@ -92,10 +92,57 @@ class Region:
     lens_mode: str = ""
     aperture: str = ""
     anode: str = ""
+    tf_ke: Optional[list] = None       # transmission-function kinetic energies
+    tf_values: Optional[list] = None   # transmission-function values
 
     @property
     def n_points(self) -> int:
         return len(self.counts) if self.counts else 0
+
+    @property
+    def kinetic_energy(self):
+        """Kinetic-energy axis (eV), or None if not decoded."""
+        if self.photon_energy is None or not self.energy:
+            return None
+        return [self.photon_energy - be for be in self.energy]
+
+    def transmission(self):
+        """Per-point transmission function, linearly interpolated from the
+        instrument's calibration pairs onto this spectrum's KE axis.
+        Returns None if no transmission function is available."""
+        if not self.tf_ke or not self.tf_values:
+            return None
+        ke = self.kinetic_energy
+        if ke is None:
+            return None
+        xs, ys = self.tf_ke, self.tf_values
+        out = []
+        for x in ke:
+            if x <= xs[0]:
+                # linear extrapolation using the first segment
+                if len(xs) > 1 and xs[1] != xs[0]:
+                    f = (x - xs[0]) / (xs[1] - xs[0])
+                    out.append(ys[0] + f * (ys[1] - ys[0]))
+                else:
+                    out.append(ys[0])
+            elif x >= xs[-1]:
+                # linear extrapolation using the last segment
+                if len(xs) > 1 and xs[-1] != xs[-2]:
+                    f = (x - xs[-2]) / (xs[-1] - xs[-2])
+                    out.append(ys[-2] + f * (ys[-1] - ys[-2]))
+                else:
+                    out.append(ys[-1])
+            else:
+                lo = 0
+                for i in range(len(xs) - 1):
+                    if xs[i] <= x <= xs[i + 1]:
+                        lo = i
+                        break
+                x0, x1 = xs[lo], xs[lo + 1]
+                y0, y1 = ys[lo], ys[lo + 1]
+                f = (x - x0) / (x1 - x0) if x1 != x0 else 0.0
+                out.append(y0 + f * (y1 - y0))
+        return out
 
 
 @dataclass
@@ -216,15 +263,17 @@ class EscapeParser:
     def _parse_samples(self):
         """Find each SampleAnalysis block and its sample identifier."""
         samples = []
+        host_like = re.compile(r"^[0-9A-Z]+(-[0-9A-Z]+)+$")
+        ignore = {"Analysis", "Spectroscopy", "Slot", "Hybrid", "Tilt"}
         for k, off in enumerate(self._find_all(self.SAMPLE_MARKER)):
             near = self._strings_between(off, off + 220)
             name = None
-            # Prefer an identifier-looking token (e.g. PR001, EXPO 18-9)
-            pat = re.compile(r"^\d*:?\s?[A-Z]{2,}[\w\- ]*\d+$")
             for _, s in near:
-                if pat.match(s) and "." not in s and "\\" not in s and len(s) <= 16:
-                    name = s
-                    break
+                if ("." in s or "\\" in s or s in ignore or len(s) > 16
+                        or host_like.match(s) or not any(c.isalnum() for c in s)):
+                    continue
+                name = s
+                break
             samples.append((off, name or f"Sample {k + 1}"))
         self.samples = samples
 
@@ -427,6 +476,11 @@ class EscapeParser:
             npairs = i32(vend + 4)
             if not (0 <= npairs < 100000):
                 return False
+            # Each pair is (kinetic energy, transmission), 2 x float64.
+            tf_ke, tf_val = [], []
+            for k in range(npairs):
+                tf_ke.append(d(vend + 8 + k * 16))
+                tf_val.append(d(vend + 8 + 8 + k * 16))
             tf_end = vend + 8 + npairs * 16
             n = i32(tf_end)
             if not (1 < n < 5_000_000):
@@ -452,6 +506,8 @@ class EscapeParser:
             reg.anode = self._anode_from_hv(hv)
             reg.dwell = dwell if (dwell == dwell and 0 < dwell < 1e4) else None
             reg.step = abs(step)
+            reg.tf_ke = tf_ke
+            reg.tf_values = tf_val
             reg.conditions.setdefault("Photon energy", f"{hv:.2f} eV")
             reg.conditions.setdefault("Anode", reg.anode)
             reg.conditions.setdefault(
@@ -635,19 +691,22 @@ def export_csv(regions, path):
     return len(usable)
 
 
-def export_vamas(regions, path, institution="Kratos", instrument="AXIS",
-                 operator="", experiment_id="", sample_id="Sample"):
+def export_vamas(regions, path, institution="Not specified",
+                 instrument="", operator="", experiment_id="",
+                 sample_id="Sample", include_transmission=True):
     """Export selected regions as a VAMAS (ISO 14976) file.
 
-    Implements the standard sequential block layout: experiment mode NORM,
-    scan mode REGULAR, technique XPS, one corresponding (ordinate) variable.
+    Sequential block layout: experiment mode NORM, scan mode REGULAR,
+    technique XPS, kinetic-energy abscissa. When the spectrometer transmission
+    function is available it is written as a second corresponding variable
+    ("Transmission"), interleaved with intensity, matching CasaXPS exports.
     Only regions with decodable data are written.
     """
     usable = [r for r in regions if r.decodable and r.counts]
     if not usable:
         raise ValueError("None of the selected regions contain decodable data.")
 
-    L = []  # one value per line
+    L = []
     a = L.append
 
     # ---- experiment header ----
@@ -659,72 +718,95 @@ def export_vamas(regions, path, institution="Kratos", instrument="AXIS",
     a("0")            # number of lines in comment
     a("NORM")         # experiment mode
     a("REGULAR")      # scan mode
-    # (experiment mode NORM) number of spectral regions:
-    a(str(len(usable)))
+    a(str(len(usable)))  # number of spectral regions (NORM)
     a("0")            # number of experimental variables
-    a("0")            # number of entries in parameter inclusion/exclusion list
-    a("0")            # number of manually entered items in block
-    a("0")            # number of future-upgrade experiment entries
-    a("0")            # number of future-upgrade block entries
+    a("0")            # parameter inclusion/exclusion list entries
+    a("0")            # manually entered items in block
+    a("0")            # future-upgrade experiment entries
+    a("0")            # future-upgrade block entries
     a(str(len(usable)))  # number of blocks
 
     now = datetime.datetime.now()
+    SENT = "1E+37"    # VAMAS "not specified" sentinel
     for r in usable:
-        e0 = r.energy[0]
-        de = (r.energy[1] - r.energy[0]) if len(r.energy) > 1 else 1.0
-        ords = r.counts
-        blk_sample = r.sample or sample_id
-        # Use the region's decoded photon energy if available.
-        hv = "1486.6"
-        if r.conditions.get("Photon energy"):
-            hv = r.conditions["Photon energy"].split()[0]
+        hv = r.photon_energy if r.photon_energy else 1486.69
+        # Kinetic-energy abscissa (matches CasaXPS and the transmission axis).
+        ke = r.kinetic_energy or [hv - be for be in r.energy]
+        ke0 = ke[0]
+        dke = (ke[1] - ke[0]) if len(ke) > 1 else 1.0
+        counts = r.counts
+        trans = r.transmission() if include_transmission else None
+        n_cv = 2 if trans else 1
+        anode = (r.anode.split()[0] if r.anode else "Al")  # element only
+        power = ""
+        if r.conditions.get("X-ray Power"):
+            power = r.conditions["X-ray Power"].replace("W", "").strip()
+        dwell = f"{r.dwell:.6g}" if r.dwell else SENT
+
         a(r.name)                 # block identifier
-        a(blk_sample)             # sample identifier
+        a(r.sample or sample_id)  # sample identifier
         a(str(now.year)); a(str(now.month)); a(str(now.day))
         a(str(now.hour)); a(str(now.minute)); a(str(now.second))
         a("0")                    # hours in advance of GMT
-        a("0")                    # number of lines in block comment
+        a("0")                    # lines in block comment
         a("XPS")                  # technique
-        a("")                     # analysis source label
-        a(hv)                     # source characteristic energy
-        a("0")                    # source strength
-        a("0")                    # beam width x
-        a("0")                    # beam width y
-        a("0")                    # source polar angle of incidence
-        a("0")                    # source azimuth
+        a(anode)                  # analysis source label
+        a(f"{hv:.6g}")            # source characteristic energy
+        a(power or SENT)          # source strength (W)
+        a(SENT)                   # beam width x
+        a(SENT)                   # beam width y
+        a(SENT)                   # source polar angle of incidence
+        a(SENT)                   # source azimuth
         a("FAT")                  # analyser mode
-        a("0")                    # pass energy / retard ratio
-        a("0")                    # magnification of transfer lens
-        a("0")                    # work function / acceptance energy
-        a("0")                    # target bias
-        a("0")                    # analysis width x
-        a("0")                    # analysis width y
-        a("0")                    # take-off polar angle
-        a("0")                    # take-off azimuth
-        a(r.name.split()[0] if r.name else "")  # species label
+        a(f"{r.pass_energy:g}" if r.pass_energy else SENT)  # pass energy
+        a(SENT)                   # magnification of transfer lens
+        a("-4.5")                 # analyser work function
+        a(SENT)                   # target bias
+        a(SENT)                   # analysis width x
+        a(SENT)                   # analysis width y
+        a(SENT)                   # take-off polar angle
+        a(SENT)                   # take-off azimuth
+        a(r.name)                 # species label
         a("")                     # transition / charge state label
         a("-1")                   # charge of detected particle
-        # (scan mode REGULAR):
-        a(r.energy_label.lower())   # abscissa label
-        a(r.energy_units)           # abscissa units
-        a(f"{e0:.6g}")              # abscissa start
-        a(f"{de:.6g}")              # abscissa increment
-        a("1")                      # number of corresponding variables
-        a(r.count_label.lower())    # corresponding variable label
-        a(r.count_units)            # corresponding variable units
-        a("pulse counting")         # signal mode
-        a("1")                      # signal collection time
-        a("1")                      # number of scans
-        a("0")                      # signal time correction
-        a("0")                      # sample normal polar angle of tilt
-        a("0")                      # sample normal tilt azimuth
-        a("0")                      # sample rotation angle
-        a("0")                      # number of additional numerical parameters
-        a(str(len(ords)))           # number of ordinate values
-        a(f"{min(ords):.6g}")       # minimum ordinate value (var 1)
-        a(f"{max(ords):.6g}")       # maximum ordinate value (var 1)
-        for v in ords:
-            a(f"{v:.6g}")
+        # (scan mode REGULAR)
+        a("Kinetic energy")       # abscissa label
+        a("eV")                   # abscissa units
+        a(f"{ke0:.6g}")           # abscissa start
+        a(f"{dke:.6g}")           # abscissa increment
+        a(str(n_cv))              # number of corresponding variables
+        a("Intensity"); a("d")    # corresponding var 1: label, units
+        if trans:
+            a("Transmission"); a("d")   # corresponding var 2
+        a("pulse counting")       # signal mode
+        a(dwell)                  # signal collection time (s)
+        a("1")                    # number of scans
+        a("0")                    # signal time correction
+        a(SENT)                   # sample normal polar angle of tilt
+        a(SENT)                   # sample normal tilt azimuth
+        a(SENT)                   # sample rotation angle
+        a("0")                    # additional numerical parameters
+
+        def fc(v):                # count: integer when whole, else 8 sig figs
+            return str(int(round(v))) if abs(v - round(v)) < 1e-6 else f"{v:.8g}"
+
+        def ft(v):                # transmission: high precision
+            return f"{v:.12g}"
+
+        a(str(len(counts) * n_cv))             # number of ordinate values
+        a(fc(min(counts)))                     # var 1 min
+        a(fc(max(counts)))                     # var 1 max
+        if trans:
+            a(ft(min(trans)))                  # var 2 min
+            a(ft(max(trans)))                  # var 2 max
+        # ordinate values, interleaved per point
+        if trans:
+            for c, t in zip(counts, trans):
+                a(fc(c))
+                a(ft(t))
+        else:
+            for c in counts:
+                a(fc(c))
 
     a("end of experiment")
     with open(path, "w", newline="\r\n") as fh:
@@ -1267,6 +1349,11 @@ class ExportDialog(tk.Toplevel):
                         variable=self.fmt).pack(anchor="w", padx=8, pady=2)
         ttk.Radiobutton(fmt_frame, text="VAMAS / ISO 14976 (.vms)", value="vamas",
                         variable=self.fmt).pack(anchor="w", padx=8, pady=2)
+        self.incl_tf = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            fmt_frame, variable=self.incl_tf,
+            text="Include spectrometer transmission function (VAMAS, "
+                 "CasaXPS-compatible)").pack(anchor="w", padx=24, pady=(0, 4))
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=12, pady=(0, 12))
@@ -1308,12 +1395,14 @@ class ExportDialog(tk.Toplevel):
                 filetypes=[("VAMAS", "*.vms"), ("VAMAS", "*.vamas")])
             if not path:
                 return
-            sample = next((s for _, s in self.app.parser.strings
-                           if s == "EXPO 18-9"), "Sample")
+            inst = self.app.parser.instrument
             try:
-                n = export_vamas(chosen, path, sample_id=sample,
-                                 experiment_id=os.path.basename(
-                                     self.app.parser.path or ""))
+                n = export_vamas(
+                    chosen, path,
+                    instrument=inst.get("Instrument", ""),
+                    operator=inst.get("Acquisition computer", ""),
+                    experiment_id=os.path.basename(self.app.parser.path or ""),
+                    include_transmission=self.incl_tf.get())
             except Exception as exc:
                 messagebox.showerror("Export failed", str(exc))
                 return
