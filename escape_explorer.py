@@ -1199,6 +1199,36 @@ def stage_to_pixel(x_mm, y_mm, img_w, img_h, c):
     return img_w / 2.0 + rx, img_h / 2.0 + ry
 
 
+def interp_intensity(region, energy):
+    """Linear interpolation of a region's intensity at a given energy.
+    Works for ascending or descending energy axes; clamps at the ends."""
+    xs, ys = region.energy, region.counts
+    if not xs or not ys:
+        return None
+    pts = sorted(zip(xs, ys))
+    xs2 = [p[0] for p in pts]
+    ys2 = [p[1] for p in pts]
+    if energy <= xs2[0]:
+        return ys2[0]
+    if energy >= xs2[-1]:
+        return ys2[-1]
+    import bisect
+    i = bisect.bisect_left(xs2, energy)
+    x0, x1 = xs2[i - 1], xs2[i]
+    y0, y1 = ys2[i - 1], ys2[i]
+    f = (energy - x0) / (x1 - x0) if x1 != x0 else 0.0
+    return y0 + f * (y1 - y0)
+
+
+def region_label(r):
+    """Concise label for a trace: depth level/time if a profile, else sample+name."""
+    if r.etch_level is not None:
+        if r.etch_time is not None:
+            return f"L{r.etch_level} ({r.etch_time:g} s)"
+        return f"L{r.etch_level}"
+    return (f"{r.sample} {r.name}".strip() if r.sample else r.name)
+
+
 class CalibrationDialog(tk.Toplevel):
     """Enter the one-time camera-to-stage calibration."""
 
@@ -1925,6 +1955,143 @@ class ExportDialog(tk.Toplevel):
         self.destroy()
 
 
+class StackedPlotWindow(tk.Toplevel):
+    """Interactive stacked / waterfall plot of selected spectra, with
+    per-spectrum normalisation (max, area, or at a clicked cursor energy),
+    an adjustable stack offset, and PDF export."""
+
+    def __init__(self, master, app, regions):
+        super().__init__(master)
+        self.app = app
+        self.regions = [r for r in regions if r.decodable and r.counts]
+        self.cursor_energy = None
+        self.title("Stacked plot")
+        self.geometry("840x720")
+        if not HAVE_MPL:
+            ttk.Label(self, padding=20,
+                      text="matplotlib is required for stacked plots.").pack()
+            return
+        if not self.regions:
+            ttk.Label(self, padding=20,
+                      text="No decodable spectra in the selection.").pack()
+            return
+
+        bar = ttk.Frame(self)
+        bar.pack(side="top", fill="x", padx=6, pady=6)
+        ttk.Label(bar, text="Normalise:").pack(side="left")
+        self.norm = tk.StringVar(value="None")
+        nb = ttk.Combobox(bar, textvariable=self.norm, width=11,
+                          state="readonly",
+                          values=["None", "Max = 1", "Area = 1", "At cursor"])
+        nb.pack(side="left", padx=(2, 12))
+        nb.bind("<<ComboboxSelected>>", lambda e: self._on_norm_change())
+
+        ttk.Label(bar, text="Stack offset:").pack(side="left")
+        self.offset_var = tk.DoubleVar(value=1.0)
+        ttk.Scale(bar, from_=0.0, to=3.0, variable=self.offset_var,
+                  orient="horizontal", length=130,
+                  command=lambda e: self._render()).pack(side="left", padx=4)
+
+        self.reverse = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="Reverse order", variable=self.reverse,
+                        command=self._render).pack(side="left", padx=8)
+        ttk.Button(bar, text="Save PDF…", command=self.save_pdf).pack(
+            side="right")
+
+        self.hint = ttk.Label(self, foreground="#a00", font=("", 9))
+        self.hint.pack(side="top", anchor="w", padx=10)
+
+        self.fig = Figure(figsize=(8, 6.6), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self)
+        NavigationToolbar2Tk(self.canvas, self)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.canvas.mpl_connect("button_press_event", self._on_click)
+        self._render()
+
+    # -- normalisation --------------------------------------------------
+    def _on_norm_change(self):
+        if self.norm.get() == "At cursor" and self.cursor_energy is None:
+            # default the cursor to the middle of the shared energy range
+            e = self.regions[0].energy
+            self.cursor_energy = (e[0] + e[-1]) / 2.0
+        self._render()
+
+    def _on_click(self, event):
+        if (self.norm.get() == "At cursor" and event.inaxes is not None
+                and event.xdata is not None):
+            self.cursor_energy = float(event.xdata)
+            self._render()
+
+    def _norm_factor(self, r):
+        mode = self.norm.get()
+        ys = r.counts
+        if mode == "Max = 1":
+            m = max(ys)
+            return m if m else 1.0
+        if mode == "Area = 1":
+            s = sum(abs(y) for y in ys)
+            return s / len(ys) if s else 1.0
+        if mode == "At cursor" and self.cursor_energy is not None:
+            v = interp_intensity(r, self.cursor_energy)
+            return v if v else 1.0
+        return 1.0
+
+    # -- drawing --------------------------------------------------------
+    def _draw(self, ax):
+        regs = list(self.regions)
+        if self.reverse.get():
+            regs = regs[::-1]
+        normed = [[y / self._norm_factor(r) for y in r.counts] for r in regs]
+        spans = [(max(n) - min(n)) for n in normed if n]
+        ref = max(spans) if spans else 1.0
+        step = self.offset_var.get() * ref
+        for i, (r, n) in enumerate(zip(regs, normed)):
+            yoff = [y + i * step for y in n]
+            line, = ax.plot(r.energy, yoff, lw=0.9)
+            ax.annotate(region_label(r), (r.energy[0], yoff[0]),
+                        textcoords="offset points", xytext=(4, 3),
+                        fontsize=7, color=line.get_color())
+        if self.norm.get() == "At cursor" and self.cursor_energy is not None:
+            ax.axvline(self.cursor_energy, color="#c00", ls="--", lw=0.8)
+        r0 = regs[0]
+        ax.set_xlabel(f"{r0.energy_label} ({r0.energy_units})")
+        ax.set_ylabel("Intensity" + (" (stacked, normalised)"
+                                     if step else " (normalised)"))
+        ax.set_title(f"Stacked plot — {len(regs)} spectra")
+        if r0.energy_label.lower().startswith("binding"):
+            ax.invert_xaxis()
+
+    def _render(self):
+        self.ax.clear()
+        self._draw(self.ax)
+        if self.norm.get() == "At cursor":
+            self.hint.config(text="Click on the plot to set the normalisation "
+                                  "energy (spectra are scaled to match there).")
+        else:
+            self.hint.config(text="")
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    def save_pdf(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pdf", filetypes=[("PDF", "*.pdf")])
+        if not path:
+            return
+        try:
+            from matplotlib.backends.backend_pdf import PdfPages
+            fig = Figure(figsize=(8.3, 10.5), dpi=150)
+            ax = fig.add_subplot(111)
+            self._draw(ax)
+            fig.tight_layout()
+            with PdfPages(path) as pdf:
+                pdf.savefig(fig)
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc))
+            return
+        messagebox.showinfo("Saved", f"Stacked plot saved to\n{path}")
+
+
 class BrowserApp:
     """Main browser window."""
 
@@ -1968,6 +2135,8 @@ class BrowserApp:
                    command=self.open_metadata).pack(side="left")
         ttk.Button(tb, text="Display window",
                    command=self.show_display).pack(side="left", padx=4)
+        ttk.Button(tb, text="Stacked plot…",
+                   command=self.open_stacked).pack(side="left")
 
         # filter row
         fb = ttk.Frame(self.root)
@@ -1999,6 +2168,8 @@ class BrowserApp:
         sb.pack(side="right", fill="y")
         self.tree.pack(side="top", expand=True, fill="both")
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        self.tree.bind("<Button-3>", self._context_menu)   # right-click
+        self.tree.bind("<Button-2>", self._context_menu)   # mac right-click
 
         self.status = ttk.Label(self.root, anchor="w", relief="sunken",
                                 text="Open a .experiment file to begin.")
@@ -2082,6 +2253,110 @@ class BrowserApp:
             self.display.show_regions(regions)
         elif only_image is not None:
             self.display.open_image(only_image)
+
+    # -- right-click menu & stacked plot -------------------------------
+    def _gather_selected_regions(self, extra_iids=()):
+        """Decodable regions under all currently-selected (or given) nodes."""
+        iids = list(self.tree.selection()) or list(extra_iids)
+        regions, seen = [], set()
+        for iid in iids:
+            node = self.node_map.get(iid)
+            if node is None:
+                continue
+            for r in DisplayWindow._regions_under(node):
+                if r.decodable and id(r) not in seen:
+                    seen.add(id(r))
+                    regions.append(r)
+        return regions
+
+    def _context_menu(self, event):
+        if not self.parser.regions:
+            return
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        # operate on the multi-selection if the clicked row is part of it,
+        # otherwise on just the clicked row
+        if row not in self.tree.selection():
+            self.tree.selection_set(row)
+        node = self.node_map.get(row)
+        regions = self._gather_selected_regions()
+        n = len(regions)
+        menu = tk.Menu(self.tree, tearoff=0)
+        if n:
+            menu.add_command(label=f"Plot these {n} spectra"
+                             if n > 1 else "Plot this spectrum",
+                             command=lambda: self._plot_regions(regions))
+            menu.add_command(label=f"Create stacked plot ({n})…",
+                             command=lambda: self._stacked(regions))
+            menu.add_separator()
+            exp = tk.Menu(menu, tearoff=0)
+            exp.add_command(label="CSV…",
+                            command=lambda: self._export_regions(regions, "csv"))
+            exp.add_command(label="VAMAS…",
+                            command=lambda: self._export_regions(regions, "vamas"))
+            menu.add_cascade(label=f"Export from here down ({n})", menu=exp)
+        else:
+            menu.add_command(label="(no decodable spectra here)",
+                             state="disabled")
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _plot_regions(self, regions):
+        self.show_display()
+        self.display.show_regions(regions)
+
+    def _stacked(self, regions):
+        regions = [r for r in regions if r.decodable and r.counts]
+        if not regions:
+            messagebox.showinfo("Stacked plot",
+                                "Select one or more decodable spectra first.")
+            return
+        StackedPlotWindow(self.root, self, regions)
+
+    def open_stacked(self):
+        regions = self._gather_selected_regions()
+        if not regions:
+            messagebox.showinfo(
+                "Stacked plot",
+                "Select one or more spectra (or a region folder) in the "
+                "browser first, then click Stacked plot.")
+            return
+        self._stacked(regions)
+
+    def _export_regions(self, regions, fmt):
+        regions = [r for r in regions if r.decodable and r.counts]
+        if not regions:
+            messagebox.showinfo("Export", "No decodable spectra here.")
+            return
+        if fmt == "csv":
+            path = filedialog.asksaveasfilename(
+                defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+            if not path:
+                return
+            try:
+                export_csv(regions, path)
+            except Exception as exc:
+                messagebox.showerror("Export failed", str(exc))
+                return
+        else:
+            path = filedialog.asksaveasfilename(
+                defaultextension=".vms",
+                filetypes=[("VAMAS", "*.vms"), ("VAMAS", "*.vamas")])
+            if not path:
+                return
+            inst = self.parser.instrument
+            try:
+                export_vamas(regions, path,
+                             instrument=inst.get("Instrument", ""),
+                             operator=inst.get("Acquisition computer", ""),
+                             experiment_id=os.path.basename(self.parser.path or ""))
+            except Exception as exc:
+                messagebox.showerror("Export failed", str(exc))
+                return
+        messagebox.showinfo("Exported", f"{len(regions)} spectra written to\n{path}")
 
     def show_display(self):
         if self.display is None or not self.display.winfo_exists():

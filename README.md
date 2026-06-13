@@ -58,7 +58,9 @@ Flags:
    energy, etch time) and a **Filter** box; its shape adapts to the file
    (samples show their stage position; depth profiles nest as Sample → region
    → per-level entries with each level's etch time, and selecting a region
-   folder takes every level under it). A second **Display** window opens
+   folder takes every level under it). **Right-click** any item for a context
+   menu: plot everything under it, export from there down (CSV/VAMAS), or
+   create a stacked plot. A second **Display** window opens
    with three panels that update live as you click items:
    * **Spectra** (top-left) — the selected spectrum. Select several at once
      (Ctrl/Shift-click, or click a sample to take all its regions) and they
@@ -88,6 +90,18 @@ Flags:
    aperture, charge-neutraliser and ion-gun status, BE range, points and
    quality. CSV gives one row per region; PDF is a formatted report with one
    section per sample.
+
+## Stacked / waterfall plots
+
+Select several spectra — e.g. depth-profile levels 0, 10, 57, 99, 150, 209, or
+any individual regions — then click **Stacked plot…** (or right-click →
+*Create stacked plot*). The window stacks the traces with an adjustable
+vertical offset and lets you normalise them: *None*, *Max = 1*, *Area = 1*, or
+*At cursor* — in the last mode you click anywhere on the plot to set an energy,
+and every spectrum is scaled to match at that point (a dashed line marks it),
+which is ideal for comparing peak-shape changes through a depth profile. Traces
+are labelled by level/etch time (or sample/region), the binding-energy axis is
+inverted, and **Save PDF…** writes the figure out.
 
 ## Depth profiles
 
